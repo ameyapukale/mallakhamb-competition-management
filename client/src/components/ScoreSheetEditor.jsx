@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'react-hot-toast'
-import { FiCheckCircle, FiPrinter, FiRotateCcw, FiSave } from 'react-icons/fi'
+import { FiCheckCircle, FiPlus, FiPrinter, FiRotateCcw, FiSave, FiTrash2, FiX } from 'react-icons/fi'
 import api from '../services/api'
 import { apparatusLabel, errorMessage, fmtScore, playerGenderLabel } from '../utils/competition'
 
@@ -36,16 +36,38 @@ const ageGroupLabel = (sheet) => {
   return sheet.age_group_name
 }
 
-const Circled = ({ on, colour, children }) => (
-  <span className={on ? `rounded-full border-2 px-1.5 ${colour}` : 'px-1.5'}>{children}</span>
+const DEFAULT_EVENT_NO = '१ अ,ब/ २ / ३'
+
+// A choice printed on the form (मुले / मुली, the apparatus); clicking it circles it
+const Circled = ({ on, colour, children, onClick, disabled }) => (
+  <button
+    type="button"
+    onClick={onClick}
+    disabled={disabled}
+    aria-pressed={on}
+    className={`${on ? `rounded-full border-2 ${colour}` : 'border-2 border-transparent'} px-1.5 font-bold enabled:hover:bg-gray-100 print:hover:bg-transparent rounded-full`}
+  >
+    {children}
+  </button>
 )
 
-const Signatures = ({ labels }) => (
+// Text written on a line of the form: looks like the printed line, but can be typed in
+const lineInput = 'min-w-0 border-0 border-b border-black bg-transparent px-1 py-0 text-blue-900 focus:outline-none focus:ring-0 focus:border-primary-500 focus:border-b-2 disabled:text-blue-900'
+
+// Name lines for the judges and officials, arranged as on the form
+const Signatures = ({ items, form, onChange, disabled }) => (
   <div className="space-y-1">
-    {labels.map((label) => (
-      <div key={label} className="flex items-end gap-3">
+    {items.map(({ key, label }) => (
+      <div key={key} className="flex items-end gap-3">
         <span className="whitespace-nowrap">{label}</span>
-        <span className="flex-1 border-b border-black mb-1.5" />
+        <input
+          value={form[key] ?? ''}
+          onChange={(e) => onChange(key, e.target.value)}
+          disabled={disabled}
+          maxLength={150}
+          aria-label={`${label} name`}
+          className={`${lineInput} flex-1 font-normal text-base`}
+        />
       </div>
     ))}
   </div>
@@ -90,6 +112,9 @@ const finalOf = (row) => {
 }
 
 const rowProblem = (row, max) => {
+  if (row._nameEdited && !String(row.player_name || '').trim() && !String(row.name_marathi || '').trim()) {
+    return "Enter the player's name"
+  }
   for (const c of JUDGE_FIELDS) {
     const v = row[c.field]
     if (v === '' || v === null || v === undefined) continue
@@ -106,10 +131,14 @@ const toEntries = (rows) => rows.map((r) => ({
   id: r.id,
   performance_time: r.performance_time || null,
   ...Object.fromEntries(JUDGE_FIELDS.map((c) => [c.field, num(r[c.field])])),
-  deduction: num(r.deduction) ?? 0
+  deduction: num(r.deduction) ?? 0,
+  // Names go along only when they were changed on this sheet
+  ...(r._nameEdited ? { player_name: r.player_name || '', name_marathi: r.name_marathi || '' } : {})
 }))
 
-const cellInput = 'w-full px-1 py-1.5 text-center border-0 bg-transparent rounded focus:ring-2 focus:ring-primary-400 disabled:bg-transparent tabular-nums print:p-0 print:placeholder-transparent'
+const toPayload = (rows, form) => ({ entries: toEntries(rows), form_details: form })
+
+const cellInput = 'w-full px-1 py-1.5 text-center border-0 bg-transparent rounded focus:ring-2 focus:ring-primary-400 print:focus:ring-0 disabled:bg-transparent tabular-nums print:p-0 print:placeholder-transparent'
 
 /**
  * One गुणपत्रिका: a team's players for one age group + apparatus. Totals update as
@@ -119,6 +148,8 @@ const cellInput = 'w-full px-1 py-1.5 text-center border-0 bg-transparent rounde
 const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
   const queryClient = useQueryClient()
   const [rows, setRows] = useState([])
+  const [form, setForm] = useState({})
+  const [adding, setAdding] = useState(null) // { name, name_marathi, gender } while the add-player row is open
   const [dirty, setDirty] = useState(false)
   const [savedAt, setSavedAt] = useState(null)
   const version = useRef(0)
@@ -129,16 +160,20 @@ const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
     refetchOnWindowFocus: false
   })
 
-  // Load rows whenever a different sheet arrives
+  // Rows and form text exactly as the server has them
+  const loadSheet = (data) => {
+    // An unscored row shows an empty गुण कपात, as on the paper form
+    setRows(data.entries.map((e) => ({
+      ...e,
+      deduction: e.final_score === null && !Number(e.deduction) ? '' : e.deduction
+    })))
+    setForm(data.form_details || {})
+    setDirty(false)
+  }
+
+  // Load whenever a different sheet arrives
   useEffect(() => {
-    if (sheet) {
-      // An unscored row shows an empty गुण कपात, as on the paper form
-      setRows(sheet.entries.map((e) => ({
-        ...e,
-        deduction: e.final_score === null && !Number(e.deduction) ? '' : e.deduction
-      })))
-      setDirty(false)
-    }
+    if (sheet) loadSheet(sheet)
   }, [sheet?.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
   const max = sheet?.max_judge_score ?? 10
@@ -147,7 +182,7 @@ const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
   const locked = sheet?.status === 'submitted' && !isAdmin
 
   const saveMutation = useMutation({
-    mutationFn: ({ payloadRows }) => api.put(`/score-sheets/${sheetId}`, { entries: toEntries(payloadRows) }),
+    mutationFn: ({ payloadRows, payloadForm }) => api.put(`/score-sheets/${sheetId}`, toPayload(payloadRows, payloadForm)),
     onSuccess: (res, { savedVersion }) => {
       const server = res.data.data
       // Keep what's being typed; take only the server's derived values
@@ -159,7 +194,10 @@ const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
       })))
       if (savedVersion === version.current) setDirty(false)
       setSavedAt(new Date())
-      queryClient.setQueryData(['score-sheet', sheetId], (old) => old && { ...old, team_points: server.team_points })
+      queryClient.setQueryData(['score-sheet', sheetId], (old) => old && {
+        ...old, team_points: server.team_points, form_details: server.form_details
+      })
+      queryClient.invalidateQueries({ queryKey: ['score-sheet'], predicate: (q) => q.queryKey[1] !== sheetId })
       queryClient.invalidateQueries({ queryKey: ['scoring-board'] })
       queryClient.invalidateQueries({ queryKey: ['results'] })
       onSaved?.()
@@ -169,7 +207,7 @@ const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
 
   const save = () => {
     if (hasProblems || locked) return
-    saveMutation.mutate({ payloadRows: rows, savedVersion: version.current })
+    saveMutation.mutate({ payloadRows: rows, payloadForm: form, savedVersion: version.current })
   }
 
   // Autosave ~1s after the last keystroke
@@ -177,16 +215,16 @@ const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
     if (!dirty || hasProblems || locked) return undefined
     const t = setTimeout(save, 1000)
     return () => clearTimeout(t)
-  }, [rows, dirty, hasProblems, locked]) // eslint-disable-line react-hooks/exhaustive-deps
+  }, [rows, form, dirty, hasProblems, locked]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Leaving the sheet (switching team, navigating away) before the autosave fired:
   // flush the pending edits instead of dropping them.
   const pending = useRef(null)
-  pending.current = dirty && !hasProblems && !locked ? rows : null
+  pending.current = dirty && !hasProblems && !locked ? { rows, form } : null
   useEffect(() => () => {
     const unsaved = pending.current
     if (!unsaved) return
-    api.put(`/score-sheets/${sheetId}`, { entries: toEntries(unsaved) }).then(() => {
+    api.put(`/score-sheets/${sheetId}`, toPayload(unsaved.rows, unsaved.form)).then(() => {
       queryClient.invalidateQueries({ queryKey: ['score-sheet', sheetId] })
       queryClient.invalidateQueries({ queryKey: ['scoring-board'] })
       queryClient.invalidateQueries({ queryKey: ['results'] })
@@ -214,7 +252,85 @@ const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
   const updateRow = (id, field, value) => {
     version.current += 1
     setDirty(true)
-    setRows((prev) => prev.map((r) => (r.id === id ? { ...r, [field]: value } : r)))
+    const isName = field === 'player_name' || field === 'name_marathi'
+    setRows((prev) => prev.map((r) => (r.id === id ? { ...r, [field]: value, ...(isName ? { _nameEdited: true } : {}) } : r)))
+  }
+
+  const updateForm = (key, value) => {
+    version.current += 1
+    setDirty(true)
+    setForm((prev) => ({ ...prev, [key]: value }))
+  }
+
+  // Add a player: save what is on the sheet first, then reload it with the new row
+  const addMutation = useMutation({
+    mutationFn: async (player) => {
+      if (dirty && !hasProblems && !locked) await api.put(`/score-sheets/${sheetId}`, toPayload(rows, form))
+      return api.post(`/score-sheets/${sheetId}/players`, {
+        name: player.name.trim(),
+        name_marathi: player.name_marathi.trim(),
+        ...(player.gender ? { gender: player.gender } : {})
+      })
+    },
+    onSuccess: (res) => {
+      const server = res.data.data
+      queryClient.setQueryData(['score-sheet', sheetId], server)
+      loadSheet(server)
+      setAdding(null)
+      toast.success('Player added — they are on this team\'s other apparatus sheets of this age group too')
+      queryClient.invalidateQueries({ queryKey: ['score-sheet'], predicate: (q) => q.queryKey[1] !== sheetId })
+      queryClient.invalidateQueries({ queryKey: ['scoring-board'] })
+      queryClient.invalidateQueries({ queryKey: ['results'] })
+      setTimeout(() => document.getElementById(`cell-${server.entries.length - 1}-performance_time`)?.focus(), 50)
+    },
+    onError: (error) => toast.error(errorMessage(error, 'Failed to add the player'))
+  })
+
+  // Remove a player: save what is on the sheet first (minus that row), then reload
+  const [sheetGone, setSheetGone] = useState(false)
+  const removeMutation = useMutation({
+    mutationFn: async (row) => {
+      const others = rows.filter((r) => r.id !== row.id)
+      if (dirty && !locked && others.every((r) => !rowProblem(r, max))) {
+        await api.put(`/score-sheets/${sheetId}`, toPayload(others, form))
+      }
+      return api.delete(`/score-sheets/${sheetId}/players/${row.player_id}`)
+    },
+    onSuccess: (res) => {
+      const server = res.data.data
+      toast.success(res.data.message)
+      queryClient.invalidateQueries({ queryKey: ['score-sheet'], predicate: (q) => q.queryKey[1] !== sheetId })
+      queryClient.invalidateQueries({ queryKey: ['scoring-board'] })
+      queryClient.invalidateQueries({ queryKey: ['results'] })
+      if (!server) {
+        setDirty(false)
+        setSheetGone(true)
+        return
+      }
+      queryClient.setQueryData(['score-sheet', sheetId], server)
+      loadSheet(server)
+    },
+    onError: (error) => toast.error(errorMessage(error, 'Failed to remove the player'))
+  })
+
+  const removePlayer = (row) => {
+    const name = row.name_marathi || row.player_name || 'this player'
+    const hasScores = INPUT_FIELDS.some((f) => f !== 'deduction' && row[f] !== '' && row[f] !== null && row[f] !== undefined)
+    const message = `Remove ${name} from ${sheet.team_name}?\n\n` +
+      `They will be taken off this team's ${sheet.age_group_name} sheets for every apparatus (not only this one).` +
+      (hasScores ? '\n\nTheir scores on those sheets will be deleted.' : '')
+    if (window.confirm(message)) removeMutation.mutate(row)
+  }
+
+  // Marathi spelling suggested from the English name, as on the team form
+  const suggestMarathi = async (english) => {
+    if (!english.trim()) return
+    try {
+      const { data } = await api.post('/public/transliterate', { text: english.trim() })
+      setAdding((a) => (a && !a.name_marathi ? { ...a, name_marathi: data.data.text } : a))
+    } catch {
+      // It can still be typed by hand
+    }
   }
 
   // Enter moves down to the same column on the next row, like a paper sheet
@@ -240,6 +356,9 @@ const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
   }, [rows, bestCount])
 
 
+  if (sheetGone) {
+    return <div className="card text-center py-10 text-gray-500">This sheet has no players left, so it was removed. Pick another sheet above.</div>
+  }
   if (isLoading || !sheet) return <div className="card text-center py-10 text-gray-500">Loading sheet…</div>
 
   const saveState = saveMutation.isPending ? 'Saving…'
@@ -249,7 +368,11 @@ const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
 
   // The paper sheet always shows at least six rows
   const blankRows = Math.max(0, MIN_ROWS - rows.length)
-  const circleColour = sheet.category === 'rope' ? 'border-red-700' : 'border-blue-800'
+  // What the form shows: the sheet's own text where it was edited, else the competition's values
+  const shownGender = form.gender || sheet.age_group_gender
+  const shownApparatus = form.apparatus || sheet.category
+  const circleColour = shownApparatus === 'rope' ? 'border-red-700' : 'border-blue-800'
+  const isMixed = sheet.age_group_gender === 'mixed'
   const th = 'border-2 border-black px-1 py-1 font-bold leading-tight'
   const td = 'border-2 border-black'
 
@@ -272,34 +395,64 @@ const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
           <h2 className="text-center text-xl font-bold">पंचांचे गुणपत्रक</h2>
 
           <div className="mt-2 flex items-end gap-10 pl-12">
-            <div className="flex items-end gap-2 flex-1">
+            <label className="flex items-end gap-2 flex-1">
               <span className="font-bold text-lg whitespace-nowrap">संघाचे नाव :</span>
-              <span className="flex-1 border-b border-black text-blue-900 px-1">{sheet.team_name}</span>
-            </div>
-            <div className="flex items-end gap-2 w-[22rem]">
+              <input
+                value={form.team_name ?? sheet.team_name}
+                onChange={(e) => updateForm('team_name', e.target.value)}
+                disabled={locked} maxLength={150}
+                className={`${lineInput} flex-1 text-lg`}
+              />
+            </label>
+            <label className="flex items-end gap-2 w-[22rem]">
               <span className="font-bold text-lg whitespace-nowrap">वयोगट :</span>
-              <span className="flex-1 border-b border-black text-blue-900 px-1">{ageGroupLabel(sheet)}</span>
-            </div>
+              <input
+                value={form.age_label ?? ageGroupLabel(sheet)}
+                onChange={(e) => updateForm('age_label', e.target.value)}
+                disabled={locked} maxLength={150}
+                className={`${lineInput} flex-1 text-lg`}
+              />
+            </label>
           </div>
 
           <div className="mt-2 flex items-center gap-8 font-bold text-lg">
-            <span className="border-2 border-black px-2 font-sans leading-tight">{APPARATUS_LETTER[sheet.category] || '?'}</span>
+            <span className="border-2 border-black px-2 font-sans leading-tight">{APPARATUS_LETTER[shownApparatus] || '?'}</span>
             <span>
-              <Circled on={sheet.age_group_gender === 'male'} colour="border-blue-800">मुले</Circled>
+              <Circled on={shownGender === 'male'} colour="border-blue-800" disabled={locked} onClick={() => updateForm('gender', 'male')}>मुले</Circled>
               {' / '}
-              <Circled on={sheet.age_group_gender === 'female'} colour="border-blue-800">मुली</Circled>
+              <Circled on={shownGender === 'female'} colour="border-blue-800" disabled={locked} onClick={() => updateForm('gender', 'female')}>मुली</Circled>
             </span>
             <span>
               {APPARATUS_MR.map((a, i) => (
                 <span key={a.value}>
                   {i > 0 && '/'}
-                  <Circled on={sheet.category === a.value} colour={circleColour}>{a.label}</Circled>
+                  <Circled on={shownApparatus === a.value} colour={circleColour} disabled={locked} onClick={() => updateForm('apparatus', a.value)}>
+                    {a.label}
+                  </Circled>
                 </span>
               ))}
             </span>
-            <span className="ml-auto whitespace-pre">{'दि.      /      / २०'}</span>
+            <label className="ml-auto flex items-end gap-1">
+              <span>दि.</span>
+              <input
+                value={form.date ?? ''}
+                onChange={(e) => updateForm('date', e.target.value)}
+                disabled={locked} maxLength={30}
+                placeholder="     /     / २०"
+                aria-label="Date"
+                className={`${lineInput} w-36 text-center placeholder:text-black print:!border-transparent`}
+              />
+            </label>
           </div>
-          <p className="text-center font-bold">स्पर्धा क्र. १ अ,ब/ २ / ३</p>
+          <label className="flex justify-center items-end gap-1 font-bold">
+            <span>स्पर्धा क्र.</span>
+            <input
+              value={form.event_no ?? DEFAULT_EVENT_NO}
+              onChange={(e) => updateForm('event_no', e.target.value)}
+              disabled={locked} maxLength={60}
+              className={`${lineInput} w-44 text-center font-bold print:!border-transparent`}
+            />
+          </label>
 
           <table className="mt-2 w-full table-fixed border-collapse text-center">
             <colgroup>
@@ -323,18 +476,48 @@ const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
                 const dropped = droppedJudges(row)
                 return (
                   <tr key={row.id} className={problems[row.id] ? 'bg-red-50 print:bg-transparent' : ''}>
-                    <td className={`${td} px-1 font-sans`}>{index + 1}.</td>
-                    <td className={`${td} px-2 py-1 text-left`}>
-                      <div className="text-blue-900 font-medium leading-snug" lang={row.name_marathi ? 'mr' : 'en'}>
-                        {row.name_marathi || row.player_name}
-                        {sheet.age_group_gender === 'mixed' && row.gender && (
-                          <span className="ml-1 text-xs text-gray-500">({playerGenderLabel(row.gender)})</span>
+                    <td className={`${td} px-1 font-sans`}>
+                      <div className="flex items-center justify-center gap-1">
+                        <span>{index + 1}.</span>
+                        {!locked && (
+                          <button
+                            type="button"
+                            onClick={() => removePlayer(row)}
+                            disabled={removeMutation.isPending}
+                            className="text-gray-400 hover:text-red-600 p-0.5 rounded print:hidden"
+                            title="Remove this player"
+                            aria-label={`Remove ${row.player_name}`}
+                          >
+                            <FiTrash2 className="w-3.5 h-3.5" />
+                          </button>
                         )}
                       </div>
-                      {row.name_marathi && (
-                        <div className="text-xs text-gray-500 print:hidden" lang="en">{row.player_name}</div>
-                      )}
-                      {problems[row.id] && <div className="text-xs text-red-600 print:hidden">{problems[row.id]}</div>}
+                    </td>
+                    <td className={`${td} px-1 py-0.5 text-left`}>
+                      <div className="flex items-center">
+                        <input
+                          value={row.name_marathi ?? ''}
+                          onChange={(e) => updateRow(row.id, 'name_marathi', e.target.value)}
+                          disabled={locked} maxLength={100}
+                          placeholder={row.player_name || 'नाव'}
+                          lang="mr"
+                          aria-label="Player name (Marathi)"
+                          className="w-full min-w-0 border-0 bg-transparent px-1 py-0.5 text-blue-900 font-medium rounded focus:ring-2 focus:ring-primary-400 print:focus:ring-0 placeholder:text-blue-900/70 print:placeholder:text-blue-900"
+                        />
+                        {isMixed && row.gender && (
+                          <span className="ml-1 text-xs text-gray-500 whitespace-nowrap">({playerGenderLabel(row.gender)})</span>
+                        )}
+                      </div>
+                      <input
+                        value={row.player_name ?? ''}
+                        onChange={(e) => updateRow(row.id, 'player_name', e.target.value)}
+                        disabled={locked} maxLength={100}
+                        placeholder="English name"
+                        lang="en"
+                        aria-label="Player name (English)"
+                        className="w-full border-0 bg-transparent px-1 py-0 text-xs text-gray-500 rounded focus:ring-2 focus:ring-primary-400 print:focus:ring-0 print:hidden"
+                      />
+                      {problems[row.id] && <div className="px-1 text-xs text-red-600 print:hidden">{problems[row.id]}</div>}
                     </td>
                     {INPUT_FIELDS.map((field) => {
                       const isTime = field === 'performance_time'
@@ -395,6 +578,57 @@ const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
                   {Array.from({ length: JUDGE_FIELDS.length + 5 }, (_, j) => <td key={j} className={td} />)}
                 </tr>
               ))}
+              {adding && (
+                <tr className="print:hidden bg-primary-50">
+                  <td className={`${td} font-sans text-gray-500`}>{rows.length + 1}.</td>
+                  <td colSpan={JUDGE_FIELDS.length + 5} className={`${td} px-2 py-2`}>
+                    <form
+                      className="flex flex-wrap items-center gap-2 text-sm font-sans"
+                      onSubmit={(e) => { e.preventDefault(); addMutation.mutate(adding) }}
+                    >
+                      <input
+                        autoFocus
+                        value={adding.name}
+                        onChange={(e) => setAdding({ ...adding, name: e.target.value })}
+                        onBlur={(e) => suggestMarathi(e.target.value)}
+                        placeholder="Player name (English)"
+                        maxLength={100}
+                        className="input py-1.5 w-56"
+                      />
+                      <input
+                        value={adding.name_marathi}
+                        onChange={(e) => setAdding({ ...adding, name_marathi: e.target.value })}
+                        placeholder="नाव (मराठी)"
+                        lang="mr"
+                        maxLength={100}
+                        className="input py-1.5 w-56"
+                      />
+                      {isMixed && (
+                        <select
+                          value={adding.gender}
+                          onChange={(e) => setAdding({ ...adding, gender: e.target.value })}
+                          className="input py-1.5 w-28"
+                          aria-label="Gender"
+                        >
+                          <option value="">Boy / Girl</option>
+                          <option value="male">Boy</option>
+                          <option value="female">Girl</option>
+                        </select>
+                      )}
+                      <button
+                        type="submit"
+                        disabled={addMutation.isPending || (!adding.name.trim() && !adding.name_marathi.trim()) || (isMixed && !adding.gender)}
+                        className="btn btn-primary py-1.5 inline-flex items-center gap-1"
+                      >
+                        <FiPlus /> {addMutation.isPending ? 'Adding…' : 'Add'}
+                      </button>
+                      <button type="button" onClick={() => setAdding(null)} className="btn btn-outline py-1.5 inline-flex items-center gap-1">
+                        <FiX /> Cancel
+                      </button>
+                    </form>
+                  </td>
+                </tr>
+              )}
               <tr>
                 <td colSpan={JUDGE_FIELDS.length + 5} className="pr-2 text-right font-bold text-lg align-middle">
                   सांघिक गुण
@@ -407,9 +641,15 @@ const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
 
           {/* Signature lines, arranged as on the form */}
           <div className="mt-2 grid grid-cols-3 gap-x-10 font-bold text-lg">
-            <Signatures labels={['पंच प्रमुख', 'पंच क्र.१', 'पंच क्र.२']} />
-            <Signatures labels={['पंच क्र.३', 'पंच क्र.४']} />
-            <Signatures labels={['गुणलेखक', 'वेळाधिकारी', 'स्पर्धा संचालक']} />
+            <Signatures form={form} onChange={updateForm} disabled={locked} items={[
+              { key: 'judge_head', label: 'पंच प्रमुख' }, { key: 'judge1', label: 'पंच क्र.१' }, { key: 'judge2', label: 'पंच क्र.२' }
+            ]} />
+            <Signatures form={form} onChange={updateForm} disabled={locked} items={[
+              { key: 'judge3', label: 'पंच क्र.३' }, { key: 'judge4', label: 'पंच क्र.४' }
+            ]} />
+            <Signatures form={form} onChange={updateForm} disabled={locked} items={[
+              { key: 'scorer', label: 'गुणलेखक' }, { key: 'timekeeper', label: 'वेळाधिकारी' }, { key: 'director', label: 'स्पर्धा संचालक' }
+            ]} />
           </div>
         </div>
       </div>
@@ -418,7 +658,8 @@ const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
         सरासरी = of judges 1–4 the highest and lowest (circled) are left out and the other two averaged; the head judge
         is not counted · अंतिम गुण = सरासरी − गुण कपात ·{' '}
         {bestCount ? `सांघिक गुण = sum of the best ${bestCount} finals (marked ✓)` : 'सांघिक गुण = sum of finals'} ·
-        Press Enter to move down a row. Print gives one A4 landscape page.
+        Every line of the form can be typed in; player names are saved to the player. Press Enter to move down a row.
+        Print gives one A4 landscape page.
       </p>
 
       <div className="flex flex-wrap items-center gap-3 print:hidden">
@@ -447,6 +688,14 @@ const ScoreSheetEditor = ({ sheetId, onSaved, isAdmin = true }) => {
             <FiRotateCcw /> Reopen
           </button>
         )}
+        <button
+          onClick={() => setAdding({ name: '', name_marathi: '', gender: '' })}
+          disabled={locked || !!adding}
+          className="btn btn-outline inline-flex items-center gap-2"
+          title="Add a player to this team in this age group"
+        >
+          <FiPlus /> Add player
+        </button>
         <button onClick={() => window.print()} className="btn btn-outline inline-flex items-center gap-2">
           <FiPrinter /> Print
         </button>

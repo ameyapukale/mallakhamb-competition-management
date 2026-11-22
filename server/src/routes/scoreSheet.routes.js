@@ -10,7 +10,51 @@ const {
   toNumber, calculateTeamPoints, deriveRow
 } = require('../utils/scoreSheet');
 
+const {
+  loadCompetition, insertPlayer, rebuildEntries, syncScoreSheets, splitName, SetupError
+} = require('../utils/competitionSetup');
+
 const SET_TYPE_VALUES = SET_TYPES.map((s) => s.value);
+
+// Free text written on the printed form (see migration 014). Empty / missing
+// means the sheet shows the competition's own value.
+const FORM_TEXT_KEYS = [
+  'team_name', 'age_label', 'date', 'event_no',
+  'judge_head', 'judge1', 'judge2', 'judge3', 'judge4', 'scorer', 'timekeeper', 'director'
+];
+const FORM_CHOICES = { gender: ['male', 'female', ''], apparatus: ['pole', 'hanging', 'rope', ''] };
+const MAX_FORM_TEXT = 150;
+const MAX_NAME = 100;
+
+const parseFormDetails = (text) => {
+  if (!text) return {};
+  try {
+    const value = JSON.parse(text);
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+};
+
+/** Keep only known keys with sensible values; throws a SetupError for bad input. */
+const cleanFormDetails = (input) => {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    throw new SetupError('Sheet details are not valid');
+  }
+  const clean = {};
+  for (const key of FORM_TEXT_KEYS) {
+    if (input[key] === undefined || input[key] === null) continue;
+    const value = String(input[key]);
+    if (value.length > MAX_FORM_TEXT) throw new SetupError(`Sheet details: "${key}" is too long`);
+    clean[key] = value;
+  }
+  for (const [key, allowed] of Object.entries(FORM_CHOICES)) {
+    if (input[key] === undefined || input[key] === null) continue;
+    if (!allowed.includes(input[key])) throw new SetupError(`Sheet details: "${key}" is not valid`);
+    clean[key] = input[key];
+  }
+  return clean;
+};
 
 // Header details plus every row, ordered as printed
 const fetchSheet = async (sheetId, executor = pool) => {
@@ -44,7 +88,9 @@ const fetchSheet = async (sheetId, executor = pool) => {
     [sheetId]
   );
 
-  return { ...sheets[0], entries, judge_columns: JUDGE_COLUMNS, max_judge_score: MAX_JUDGE_SCORE };
+  const { form_details: formText, ...sheet } = sheets[0];
+  return {
+    ...sheet, form_details: parseFormDetails(formText), entries, judge_columns: JUDGE_COLUMNS, max_judge_score: MAX_JUDGE_SCORE };
 };
 
 // Recompute every derived value on a sheet and persist it
@@ -302,6 +348,14 @@ router.put('/:id', authenticateToken, isScorer, [
   try {
     const sheetId = req.params.id;
     const { entries = [], event_number, panel_id, remarks, set_type } = req.body;
+    let formDetails = null;
+    if (req.body.form_details !== undefined) {
+      try {
+        formDetails = cleanFormDetails(req.body.form_details);
+      } catch (e) {
+        return res.status(400).json({ success: false, message: e.message });
+      }
+    }
 
     const [sheets] = await connection.execute(
       'SELECT id, status FROM score_sheets WHERE id = ?',
@@ -321,10 +375,11 @@ router.put('/:id', authenticateToken, isScorer, [
 
     // Rows must belong to this sheet
     const [ownRows] = await connection.execute(
-      'SELECT id FROM score_sheet_entries WHERE score_sheet_id = ?',
+      'SELECT id, player_id FROM score_sheet_entries WHERE score_sheet_id = ?',
       [sheetId]
     );
     const ownIds = new Set(ownRows.map((r) => r.id));
+    const playerOfRow = new Map(ownRows.map((r) => [r.id, r.player_id]));
 
     for (const entry of entries) {
       if (!ownIds.has(Number(entry.id))) {
@@ -347,6 +402,18 @@ router.put('/:id', authenticateToken, isScorer, [
       const deduction = toNumber(entry.deduction);
       if (deduction !== null && deduction < 0) {
         return res.status(400).json({ success: false, message: 'गुण कपात cannot be negative' });
+      }
+
+      // Names typed on the sheet (only sent when the sheet edits names)
+      if (entry.player_name !== undefined || entry.name_marathi !== undefined) {
+        const english = String(entry.player_name ?? '').trim();
+        const marathi = String(entry.name_marathi ?? '').trim();
+        if (!english && !marathi) {
+          return res.status(400).json({ success: false, message: 'A player name cannot be left empty' });
+        }
+        if (english.length > MAX_NAME || marathi.length > MAX_NAME) {
+          return res.status(400).json({ success: false, message: 'A player name is too long' });
+        }
       }
     }
 
@@ -371,6 +438,19 @@ router.put('/:id', authenticateToken, isScorer, [
           sheetId
         ]
       );
+
+      if (entry.player_name !== undefined || entry.name_marathi !== undefined) {
+        const { first_name, last_name } = splitName(entry.player_name);
+        await connection.execute(
+          'UPDATE players SET first_name = ?, last_name = ?, name_marathi = ? WHERE id = ?',
+          [first_name, last_name, String(entry.name_marathi ?? '').trim() || null, playerOfRow.get(Number(entry.id))]
+        );
+      }
+    }
+
+    if (formDetails) {
+      await connection.execute('UPDATE score_sheets SET form_details = ? WHERE id = ?',
+        [JSON.stringify(formDetails), sheetId]);
     }
 
     await connection.execute(
@@ -405,6 +485,130 @@ router.put('/:id', authenticateToken, isScorer, [
     if (inTransaction) await connection.rollback();
     console.error('Save score sheet error:', error);
     res.status(500).json({ success: false, message: 'Failed to save score sheet' });
+  } finally {
+    connection.release();
+  }
+});
+
+// Add a player to the sheet's team, in the sheet's age group. Like adding them
+// on the team page: they get a row on every apparatus sheet of that age group.
+router.post('/:id/players', authenticateToken, isScorer, [
+  param('id').isInt().withMessage('Valid sheet ID is required'),
+  body('name').optional({ values: 'falsy' }).isString().trim().isLength({ max: MAX_NAME }),
+  body('name_marathi').optional({ values: 'falsy' }).isString().trim().isLength({ max: MAX_NAME }),
+  body('gender').optional({ values: 'falsy' }).isIn(['male', 'female']).withMessage('Choose Boy or Girl'),
+  validate
+], async (req, res) => {
+  const connection = await pool.getConnection();
+  let inTransaction = false;
+  try {
+    const name = String(req.body.name || '').trim();
+    const nameMarathi = String(req.body.name_marathi || '').trim();
+    if (!name && !nameMarathi) {
+      return res.status(400).json({ success: false, message: "Enter the player's name" });
+    }
+
+    const [[sheet]] = await connection.execute(
+      `SELECT ss.id, ss.status, ss.competition_id, ss.team_id, ag.id AS age_group_id, ag.gender AS group_gender
+       FROM score_sheets ss
+       JOIN competition_categories cc ON ss.competition_category_id = cc.id
+       JOIN age_groups ag ON cc.age_group_id = ag.id
+       WHERE ss.id = ?`,
+      [req.params.id]
+    );
+    if (!sheet) return res.status(404).json({ success: false, message: 'Score sheet not found' });
+    if (sheet.status === 'submitted' && req.user.role !== 'admin') {
+      return res.status(400).json({ success: false, message: 'This sheet has been submitted. Ask an admin to reopen it.' });
+    }
+
+    const gender = sheet.group_gender === 'mixed' ? req.body.gender : sheet.group_gender;
+    if (!gender) return res.status(400).json({ success: false, message: 'Choose Boy or Girl' });
+
+    // The same name twice in one team and age group is almost always a double entry
+    const [same] = await connection.execute(
+      `SELECT id FROM players WHERE team_id = ? AND age_group_id = ? AND
+         ((? <> '' AND LOWER(TRIM(CONCAT(first_name, ' ', last_name))) = LOWER(?)) OR (? <> '' AND name_marathi = ?))`,
+      [sheet.team_id, sheet.age_group_id, name, name, nameMarathi, nameMarathi]
+    );
+    if (same.length) {
+      return res.status(400).json({ success: false, message: 'This player is already in the team' });
+    }
+
+    await connection.beginTransaction();
+    inTransaction = true;
+    const competition = await loadCompetition(connection, sheet.competition_id);
+    if (!competition) throw new SetupError('Competition not found');
+    const [inserted] = await insertPlayer(connection, sheet.team_id, {
+      ...splitName(name), name_marathi: nameMarathi || null, gender, date_of_birth: null,
+      age_group: { id: sheet.age_group_id }
+    });
+    await rebuildEntries(connection, sheet.competition_id);
+    await connection.commit();
+    inTransaction = false;
+
+    await logActivity(req.user.id, 'SCORE_SHEET_PLAYER_ADDED', 'players', inserted.insertId, null,
+      { score_sheet_id: sheet.id, name: name || nameMarathi }, req);
+
+    res.status(201).json({ success: true, message: 'Player added', data: await fetchSheet(sheet.id) });
+  } catch (error) {
+    if (inTransaction) await connection.rollback();
+    if (error instanceof SetupError) return res.status(400).json({ success: false, message: error.message });
+    console.error('Add player to score sheet error:', error);
+    res.status(500).json({ success: false, message: 'Failed to add the player' });
+  } finally {
+    connection.release();
+  }
+});
+
+// Remove a player from the sheet's team. A player's rows on the team's sheets
+// go together (every apparatus of their age group), so this removes the player
+// from the team and with them their rows - and any scores - on those sheets.
+router.delete('/:id/players/:playerId', authenticateToken, isScorer, [
+  param('id').isInt().withMessage('Valid sheet ID is required'),
+  param('playerId').isInt().withMessage('Valid player ID is required'),
+  validate
+], async (req, res) => {
+  const connection = await pool.getConnection();
+  let inTransaction = false;
+  try {
+    const sheetId = Number(req.params.id);
+    const playerId = Number(req.params.playerId);
+    const [[row]] = await connection.execute(
+      `SELECT ss.status, ss.competition_id, TRIM(CONCAT(p.first_name, ' ', p.last_name)) AS name
+       FROM score_sheet_entries sse
+       JOIN score_sheets ss ON sse.score_sheet_id = ss.id
+       JOIN players p ON sse.player_id = p.id
+       WHERE sse.score_sheet_id = ? AND sse.player_id = ?`,
+      [sheetId, playerId]
+    );
+    if (!row) return res.status(404).json({ success: false, message: 'This player is not on the sheet' });
+    if (row.status === 'submitted' && req.user.role !== 'admin') {
+      return res.status(400).json({ success: false, message: 'This sheet has been submitted. Ask an admin to reopen it.' });
+    }
+
+    await connection.beginTransaction();
+    inTransaction = true;
+    // Entries and sheet rows go with the player (ON DELETE CASCADE)
+    await connection.execute('DELETE FROM players WHERE id = ?', [playerId]);
+    // Team scores change, and a sheet left with no rows is dropped
+    await syncScoreSheets(connection, row.competition_id);
+    await connection.commit();
+    inTransaction = false;
+
+    await logActivity(req.user.id, 'SCORE_SHEET_PLAYER_REMOVED', 'players', playerId, null,
+      { score_sheet_id: sheetId, name: row.name }, req);
+
+    const sheet = await fetchSheet(sheetId);
+    res.json({
+      success: true,
+      message: sheet ? 'Player removed' : 'Player removed. The sheet had no players left, so it was removed too.',
+      data: sheet
+    });
+  } catch (error) {
+    if (inTransaction) await connection.rollback();
+    if (error instanceof SetupError) return res.status(400).json({ success: false, message: error.message });
+    console.error('Remove player from score sheet error:', error);
+    res.status(500).json({ success: false, message: 'Failed to remove the player' });
   } finally {
     connection.release();
   }

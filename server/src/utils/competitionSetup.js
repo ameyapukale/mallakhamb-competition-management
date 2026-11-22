@@ -759,6 +759,8 @@ module.exports = {
   rangeLabel,
   findAgeGroup,
   fullName,
+  splitName,
+  insertPlayer,
   loadCompetition,
   loadAgeGroups,
   validateAgeGroups,
